@@ -13,8 +13,9 @@ class TimescaleQuery(BaseModel):
 class Queries(BaseModel):
     queries: list[TimescaleQuery]
 
-def selfQuery(query) -> dict:
-    print("Generando parametros de busqueda...")
+def selfQuery(query: str, verbose: bool) -> dict:
+    if verbose:
+        print("Generando parametros de busqueda...")
     sqstart_time = datetime.now()
     SYSTEM_PROMPT = """Imagina que eres un asistente muy preciso, que debe definir parametros de busqueda en una base de datos.
 La base de datos en la que buscaras se tratanicano de documentos que resumen activos de estados financerios del banco domi\
@@ -87,7 +88,8 @@ la respuesta en formato JSON, solo devolviendo el objeto JSON.
 
     sqend_time = datetime.now()
     sqdelta = sqend_time - sqstart_time
-    print(f"({int(sqdelta.total_seconds()*1000)} ms)")
+    if verbose:
+        print(f"({int(sqdelta.total_seconds()*1000)} ms)")
 
     return parsedQueries
 

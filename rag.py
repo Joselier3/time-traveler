@@ -8,19 +8,16 @@ from pathlib import Path
 
 from langchain_community.document_loaders.json_loader import JSONLoader
 from langchain_community.vectorstores.timescalevector import TimescaleVector
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.messages import SystemMessage
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveJsonSplitter
 from langchain.docstore.document import Document
 from timescale_vector import client
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import ChatOpenAI
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
-from langchain_core.output_parsers import StrOutputParser
 
-from langchain_core.retrievers import BaseRetriever
 from selfquery import selfQuery
+from tools import TOOLS_DICT, TOOLS_LIST
 
 load_dotenv(".env.development.local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -30,6 +27,7 @@ COLLECTION_NAME = "statements"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-b", "--builddb", action="store_true", help="Builds a Timescale database from scratch with the specified json data")
+parser.add_argument("-v", "--verbose", action="store_true", help="Prints duration of each process")
 ARGS = parser.parse_args()
 
 class CustomTimescaleRetriever(BaseRetriever):
@@ -37,13 +35,14 @@ class CustomTimescaleRetriever(BaseRetriever):
     k: int = 4
     
     def _get_relevant_documents(
-        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+        self, query: str,
     ) -> List[Document]:
 
-        queries = selfQuery(query)
+        queries = selfQuery(query, verbose=ARGS.verbose)
         
         rstart_time = datetime.now()
-        print(f"Realizando {len(queries)} busquedas...")
+        if ARGS.verbose:
+            print(f"Realizando {len(queries)} busquedas...")
         docs_retrieved = []
         for queryObj in queries:
             docs = db.similarity_search(queryObj["query"], start_date=queryObj["start_date"], end_date=queryObj["end_date"])
@@ -54,7 +53,8 @@ class CustomTimescaleRetriever(BaseRetriever):
 
         rend_time = datetime.now()
         rdelta = rend_time - rstart_time
-        print(f"({int(rdelta.total_seconds()*1000)} ms)")
+        if ARGS.verbose:
+            print(f"({int(rdelta.total_seconds()*1000)} ms)")
         return docs_retrieved
 
 def extract_metadata(record: dict, metadata: dict) -> dict:
@@ -121,23 +121,79 @@ def format_docs(docGroups):
 
     return finalFormat
 
-def buildRAG(db: TimescaleVector):
-    retriever = CustomTimescaleRetriever(db=db) 
-    llm = ChatOpenAI(temperature=0, model="gpt-4o")
-    template = """Responde la siguiente pregunta sobre los estados financieros de Citibank con el siguiente contexto:
-    {context}
+class TimeRAG():
+    def __init__(self, db: TimescaleVector):
+        self.retriever = CustomTimescaleRetriever(db=db)
+        self.llm = ChatOpenAI(temperature=0, model="gpt-4o").bind_tools(TOOLS_LIST, strict=True)
 
-    Pregunta: {question}
-    """
-    prompt = ChatPromptTemplate.from_template(template)
-    rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+        template = """Responde la siguiente pregunta sobre los estados financieros de Citibank con el siguiente contexto:
+        {context}
 
-    return rag_chain
+        Pregunta: {question}
+        """
+        self.prompt = ChatPromptTemplate.from_template(template)
+        
+        self.system = SystemMessage("""Eres un asistente virtual especializado en responder preguntas sobre los \
+estados financieros de Citibank. Tu función es proporcionar información basada únicamente en \
+los datos disponibles y confirmados sobre los estados financieros de Citibank. No debes \
+realizar cálculos ni suposiciones. Si una cifra específica o un dato no está disponible, responde con cortesía \
+indicando que no tienes la cifra solicitada.
+
+Tu objetivo es ofrecer respuestas claras y precisas, proporcionando la información más relevante sobre el contexto \
+financiero del banco Citibank, y siempre refiriéndote a los datos disponibles en los informes oficiales, sin hacer \
+estimaciones ni extrapolaciones.""")
+        self.messages = [self.system]
+
+    def addMessage(self, newMessage):
+        if len(self.messages) < 10:
+            self.messages.append(newMessage)
+        else:
+            self.messages.pop(0)
+            self.messages.append(newMessage)
+    
+    def chat(self, question):
+        relevant_docs = self.retriever._get_relevant_documents(question)
+        context = format_docs(relevant_docs)
+        prompt = self.prompt.invoke({
+            "context": context,
+            "question": question
+        }).to_messages()[0]
+        self.addMessage(prompt)
+
+        if ARGS.verbose:
+            print("Calling initial completion...")
+        tam_start_time = datetime.now()
+        tool_ai_msg = self.llm.invoke(self.messages)
+        tam_end_time = datetime.now()
+        init_comp_delta = tam_end_time - tam_start_time
+        if ARGS.verbose:
+            print(f"({int(init_comp_delta.total_seconds()*1000)} ms)")
+
+        self.addMessage(tool_ai_msg)
+
+        if tool_ai_msg.tool_calls:
+            for tool_call in tool_ai_msg.tool_calls:
+                tool = TOOLS_DICT[tool_call["name"].lower()]
+                tool_msg = tool.invoke(tool_call)
+                self.addMessage(tool_msg)
+            
+            if ARGS.verbose:
+                print("Calling final completion (with tool results)...")
+            fstart_time = datetime.now()
+            response = self.llm.invoke(self.messages)
+            fend_time = datetime.now()
+            fdelta = fend_time - fstart_time
+            if ARGS.verbose:
+                print(f"({int(fdelta.total_seconds()*1000)} ms)")
+                print()
+
+            self.addMessage(response)
+            return response.content
+        else:
+            if ARGS.verbose:
+                print()
+            return tool_ai_msg.content
+
 
 if __name__=="__main__":
     if(ARGS.builddb):
@@ -157,21 +213,28 @@ if __name__=="__main__":
 
         tdb_end_time = datetime.now()
         tdb_delta = tdb_end_time - tdb_start_time
-        print(f"({int(tdb_delta.total_seconds() * 1000)} ms)")
+        if ARGS.verbose:
+            print(f"({int(tdb_delta.total_seconds() * 1000)} ms)")
 
-    rag_chain = buildRAG(db)
+    time_rag = TimeRAG(db)
     
     print("Hola! Soy Max, tu asistente personal de datos bancarios.")
-    print("Escribe \'quit\' para terminar la sesion.\n")
-    print("Escribe tu pregunta aca abajo:")
+    print("Escribe \'quit()\' para terminar la sesión.\n")
+    print("Escribe tu pregunta acá abajo:")
 
     question = ""
     while True:
         question = input(">>> ")
 
-        if question=='quit':
+        if question=='quit()':
             break
         elif question=='':
             print("Por favor, haz una pregunta")
         else:
-            print(rag_chain.invoke(question))
+            res_start_time = datetime.now()
+            print(time_rag.chat(question))
+            res_end_time = datetime.now()
+            res_delta = res_end_time - res_start_time
+            if ARGS.verbose:
+                print()
+                print(f"Response duration: {int(res_delta.total_seconds()*1000)} ms")
