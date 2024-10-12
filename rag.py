@@ -17,7 +17,7 @@ from langchain.docstore.document import Document
 from timescale_vector import client
 
 from selfquery import selfQuery
-from tools import TOOLS_DICT, TOOLS_LIST
+from tools import TOOLS_DICT, suma, promedio, mediana
 
 load_dotenv(".env.development.local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -124,7 +124,7 @@ def format_docs(docGroups):
 class TimeRAG():
     def __init__(self, db: TimescaleVector):
         self.retriever = CustomTimescaleRetriever(db=db)
-        self.llm = ChatOpenAI(temperature=0, model="gpt-4o").bind_tools(TOOLS_LIST, strict=True)
+        self.llm = ChatOpenAI(temperature=0, model="gpt-4o").bind_tools([suma, promedio, mediana], strict=True)
 
         template = """Responde la siguiente pregunta sobre los estados financieros de Citibank con el siguiente contexto:
         {context}
@@ -162,6 +162,7 @@ estimaciones ni extrapolaciones.""")
 
         if ARGS.verbose:
             print("Calling initial completion...")
+
         tam_start_time = datetime.now()
         tool_ai_msg = self.llm.invoke(self.messages)
         tam_end_time = datetime.now()

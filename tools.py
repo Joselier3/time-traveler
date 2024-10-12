@@ -83,7 +83,7 @@ def desviacion_estandar(valores: List[float]) -> float:
     """
     return statistics.stdev(valores)
 
-TOOLS_LIST = [suma, promedio, mediana, moda, rango, cuantiles, varianza, desviacion_estandar]
+TOOLS_LIST = [suma, promedio, mediana]
 TOOLS_DICT = {
     "suma": suma,
     "promedio": promedio,
